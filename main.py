@@ -1,6 +1,13 @@
 import os
-from fastapi import FastAPI
+from datetime import datetime
+from typing import Any, Dict, List
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from database import db, create_document
+from schemas import Donation as DonationSchema
 
 app = FastAPI()
 
@@ -12,13 +19,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI Backend!"}
 
+
 @app.get("/api/hello")
 def hello():
     return {"message": "Hello from the backend API!"}
+
 
 @app.get("/test")
 def test_database():
@@ -31,38 +41,109 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
+
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
             response["database_url"] = "✅ Configured"
             response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
+
     # Check environment variables
-    import os
     response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+
     return response
+
+
+# ---------------- Donation API ----------------
+class DonationRequest(DonationSchema):
+    """Incoming donation payload"""
+    pass
+
+
+@app.post("/donations")
+async def create_donation(payload: DonationRequest):
+    """Create a new donation entry in the database"""
+    try:
+        data = payload.model_dump()
+        # Ensure amount is stored as float for compatibility
+        if isinstance(data.get("amount"), (str,)):
+            try:
+                data["amount"] = float(data["amount"])  # type: ignore
+            except Exception:
+                raise HTTPException(status_code=422, detail="Invalid amount")
+        else:
+            try:
+                data["amount"] = float(data["amount"])  # type: ignore
+            except Exception:
+                pass
+
+        inserted_id = create_document("donation", data)
+        return {"status": "success", "id": inserted_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/donations")
+async def list_donations(limit: int = 20) -> List[Dict[str, Any]]:
+    """List recent donations (most recent first)"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    try:
+        cursor = db["donation"].find({}).sort("created_at", -1).limit(limit)
+        results: List[Dict[str, Any]] = []
+        for doc in cursor:
+            doc["id"] = str(doc.pop("_id"))
+            # Serialize datetime
+            if isinstance(doc.get("created_at"), datetime):
+                doc["created_at"] = doc["created_at"].isoformat()
+            if isinstance(doc.get("updated_at"), datetime):
+                doc["updated_at"] = doc["updated_at"].isoformat()
+            # Ensure amount is a float
+            try:
+                doc["amount"] = float(doc.get("amount", 0))
+            except Exception:
+                pass
+            results.append(doc)
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/donations/summary")
+async def donation_summary() -> Dict[str, Any]:
+    """Aggregate summary of donations"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    try:
+        total_count = db["donation"].count_documents({})
+        pipeline = [
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}, "recurring": {"$sum": {"$cond": ["$recurring", 1, 0]}}}},
+        ]
+        agg = list(db["donation"].aggregate(pipeline))
+        total_amount = float(agg[0]["total"]) if agg else 0.0
+        recurring_count = int(agg[0]["recurring"]) if agg else 0
+        return {
+            "total_donations": total_count,
+            "total_amount": round(total_amount, 2),
+            "recurring_count": recurring_count,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
